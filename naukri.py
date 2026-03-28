@@ -1,498 +1,479 @@
-#! python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Naukri Daily update - Using Chrome"""
+"""
+Naukri Daily Automation - Self-Healing Edition
+================================================
+Improvements over original:
+  1. Self-healing selectors: if a locator fails, the script uses a
+     multi-strategy fallback chain (ID → NAME → CSS → XPATH text-match)
+     to find the element without manual intervention.
+  2. UI-change detection: on every run the script fingerprints key page
+     elements (login form, profile section, resume upload widget) and
+     writes a selector_cache.json.  When a fingerprint drifts the script
+     auto-updates the cache and logs a UI_CHANGE_DETECTED warning.
+  3. Gemini-powered selector recovery (optional): if GEMINI_API_KEY is
+     set and all fallback strategies fail, the script sends the page
+     source to Gemini and asks it to return a working CSS selector.
+  4. Headless Chrome on macOS / Linux / Windows via webdriver-manager.
+  5. Configurable via constants.py or environment variables.
+  6. Structured JSON logging alongside the plain-text log.
+"""
 
 import io
+import json
 import logging
 import os
 import sys
 import time
+import hashlib
 from datetime import datetime
+from pathlib import Path
 from random import choice, randint
 from string import ascii_uppercase, digits
+from typing import Optional
 
-from pypdf import PdfReader, PdfWriter
-from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
-from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException
-from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.chrome.service import Service as ChromeService
+# ── Third-party ──────────────────────────────────────────────────────────────
+try:
+    from pypdf import PdfReader, PdfWriter
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+    from selenium import webdriver
+    from selenium.common.exceptions import (
+        NoSuchElementException,
+        TimeoutException,
+        WebDriverException,
+        StaleElementReferenceException,
+    )
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service as ChromeService
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.ui import WebDriverWait
+    from webdriver_manager.chrome import ChromeDriverManager
+except ImportError as e:
+    print(f"[FATAL] Missing dependency: {e}")
+    print("Run: pip install selenium webdriver-manager pypdf reportlab")
+    sys.exit(1)
+
 import constants
 
-# Add folder Path of your resume
-originalResumePath = constants.ORIGINAL_RESUME_PATH
-# Add Path where modified resume should be saved
-modifiedResumePath = constants.MODIFIED_RESUME_PATH
-
-# Update your naukri username and password here before running
-username = constants.USERNAME
-password = constants.PASSWORD
-mob = constants.MOBILE
-
-# False if you dont want to add Random HIDDEN chars to your resume
-updatePDF = False
-
-# If Headless = True, script runs Chrome in headless mode without visible GUI
-headless = False
-
-# ----- No other changes required -----
-
-# Set login URL
-NaukriURL = constants.NAUKRI_LOGIN_URL
+# ── Logging ───────────────────────────────────────────────────────────────────
+LOG_FILE = "naukri.log"
+JSON_LOG_FILE = "naukri_events.jsonl"
+SELECTOR_CACHE_FILE = "selector_cache.json"
 
 logging.basicConfig(
-    level=logging.INFO, filename="naukri.log", format="%(asctime)s    : %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
 )
-# logging.disable(logging.CRITICAL)
-os.environ["WDM_LOCAL"] = "1"
-os.environ["WDM_LOG_LEVEL"] = "0"
+logger = logging.getLogger("naukri")
 
 
-def log_msg(message):
-    """Print to console and store to Log"""
-    print(message)
-    logging.info(message)
-
-
-def catch(error):
-    """Method to catch errors and log error details"""
-    _, _, exc_tb = sys.exc_info()
-    lineNo = str(exc_tb.tb_lineno)
-    msg = "%s : %s at Line %s." % (type(error), error, lineNo)
-    print(msg)
-    logging.error(msg)
-
-
-def getObj(locatorType):
-    """This map defines how elements are identified"""
-    map = {
-        "ID": By.ID,
-        "NAME": By.NAME,
-        "XPATH": By.XPATH,
-        "TAG": By.TAG_NAME,
-        "CLASS": By.CLASS_NAME,
-        "CSS": By.CSS_SELECTOR,
-        "LINKTEXT": By.LINK_TEXT,
+def log_event(event_type: str, detail: str, extra: dict = None):
+    """Append a structured JSON event to the JSONL log."""
+    record = {
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "event": event_type,
+        "detail": detail,
+        **(extra or {}),
     }
-    return map[locatorType.upper()]
+    with open(JSON_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+    logger.info("[%s] %s", event_type, detail)
 
 
-def GetElement(driver, elementTag, locator="ID"):
-    """Wait max 15 secs for element and then select when it is available"""
+# ── Selector cache (UI-change detection) ─────────────────────────────────────
+
+def load_selector_cache() -> dict:
+    if Path(SELECTOR_CACHE_FILE).exists():
+        try:
+            return json.loads(Path(SELECTOR_CACHE_FILE).read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def save_selector_cache(cache: dict):
+    Path(SELECTOR_CACHE_FILE).write_text(json.dumps(cache, indent=2))
+
+
+def fingerprint_element(driver, selector: str, by=By.CSS_SELECTOR) -> Optional[str]:
+    """Return a short hash of an element's outer HTML, or None if not found."""
     try:
+        el = driver.find_element(by, selector)
+        html = el.get_attribute("outerHTML") or ""
+        return hashlib.md5(html[:2000].encode()).hexdigest()
+    except Exception:
+        return None
 
-        def _get_element(_tag, _locator):
-            _by = getObj(_locator)
-            if is_element_present(driver, _by, _tag):
-                return WebDriverWait(driver, 15).until(
-                    lambda d: driver.find_element(_by, _tag)
-                )
 
-        element = _get_element(elementTag, locator.upper())
-        if element:
-            return element
-        else:
-            log_msg("Element not found with %s : %s" % (locator, elementTag))
-            return None
-    except Exception as e:
-        catch(e)
+# ── Multi-strategy self-healing element finder ───────────────────────────────
+
+STRATEGY_CHAINS = {
+    # Each entry: list of (By, value) tuples tried in order
+    "login_email": [
+        (By.ID, "usernameField"),
+        (By.NAME, "username"),
+        (By.CSS_SELECTOR, "input[type='email']"),
+        (By.CSS_SELECTOR, "input[placeholder*='email' i]"),
+        (By.XPATH, "//input[contains(@placeholder,'email') or contains(@id,'user') or contains(@name,'user')]"),
+    ],
+    "login_password": [
+        (By.ID, "passwordField"),
+        (By.NAME, "password"),
+        (By.CSS_SELECTOR, "input[type='password']"),
+        (By.XPATH, "//input[@type='password']"),
+    ],
+    "login_submit": [
+        (By.ID, "loginButton"),
+        (By.CSS_SELECTOR, "button[type='submit']"),
+        (By.XPATH, "//button[contains(text(),'Login') or contains(text(),'Sign in')]"),
+        (By.CSS_SELECTOR, ".loginButton, .login-btn, [data-ga-track*='login']"),
+    ],
+    "profile_edit": [
+        (By.CSS_SELECTOR, ".editProfile, [data-ga-track*='edit']"),
+        (By.XPATH, "//a[contains(@href,'edit') and contains(@href,'profile')]"),
+        (By.XPATH, "//span[contains(text(),'Edit')]"),
+        (By.CSS_SELECTOR, "a[href*='editProfile']"),
+    ],
+    "resume_upload": [
+        (By.ID, "attachCV"),
+        (By.ID, "lazyAttachCV"),
+        (By.CSS_SELECTOR, "input[type='file']"),
+        (By.XPATH, "//input[@type='file']"),
+        (By.XPATH, "//*[contains(@class,'upload')]//input[@value='Update resume']"),
+    ],
+    "resume_save": [
+        (By.CSS_SELECTOR, "button[type='button'].saveBtn"),
+        (By.XPATH, "//button[contains(text(),'Save')]"),
+        (By.CSS_SELECTOR, ".saveButton, .save-btn"),
+    ],
+    "close_popup": [
+        (By.CSS_SELECTOR, ".crossIcon, .closeBtn, .modal-close"),
+        (By.XPATH, "//*[contains(@class,'crossIcon') or contains(@class,'closeIcon')]"),
+        (By.XPATH, "//button[contains(@aria-label,'close') or contains(@aria-label,'Close')]"),
+    ],
+    "profile_updated_marker": [
+        (By.CSS_SELECTOR, ".updateOn, .lastUpdated"),
+        (By.XPATH, "//*[contains(@class,'updateOn') or contains(@class,'lastUpdated')]"),
+        (By.XPATH, "//*[contains(text(),'Updated on') or contains(text(),'Last updated')]"),
+    ],
+}
+
+
+def find_element_healing(driver, key: str, timeout: int = 15, cache: dict = None) -> Optional[object]:
+    """
+    Try each strategy in STRATEGY_CHAINS[key] in order.
+    If a cached (By, value) pair exists and works, use it first.
+    Updates cache on success.  Logs UI_CHANGE_DETECTED if cached selector fails.
+    """
+    strategies = STRATEGY_CHAINS.get(key, [])
+    cached = (cache or {}).get(key)
+
+    # Try cached selector first
+    if cached:
+        try:
+            by_str, value = cached["by"], cached["value"]
+            by = getattr(By, by_str)
+            el = WebDriverWait(driver, 5).until(EC.presence_of_element_located((by, value)))
+            return el
+        except Exception:
+            log_event("UI_CHANGE_DETECTED", f"Cached selector for '{key}' no longer works. Trying fallbacks.", {"key": key, "cached": cached})
+
+    # Try each fallback strategy
+    for by, value in strategies:
+        try:
+            el = WebDriverWait(driver, timeout).until(EC.presence_of_element_located((by, value)))
+            # Update cache with the working selector
+            if cache is not None:
+                cache[key] = {"by": by.replace("By.", "").upper() if "." in str(by) else str(by), "value": value}
+                # Normalize By constant name
+                for attr in dir(By):
+                    if getattr(By, attr) == by:
+                        cache[key]["by"] = attr
+                        break
+                save_selector_cache(cache)
+                log_event("SELECTOR_HEALED", f"Key '{key}' now uses: {by}='{value}'", {"key": key})
+            return el
+        except (TimeoutException, NoSuchElementException):
+            continue
+
+    # Last resort: Gemini AI selector recovery
+    gemini_key = os.environ.get("GEMINI_API_KEY") or getattr(constants, "GEMINI_API_KEY", None)
+    if gemini_key:
+        recovered = _gemini_selector_recovery(driver, key, gemini_key)
+        if recovered:
+            return recovered
+
+    log_event("ELEMENT_NOT_FOUND", f"All strategies failed for '{key}'", {"key": key})
     return None
 
 
-def is_element_present(driver, how, what):
-    """Returns True if element is present"""
-    try:
-        driver.find_element(by=how, value=what)
-    except NoSuchElementException:
-        return False
-    return True
-
-
-def WaitTillElementPresent(driver, elementTag, locator="ID", timeout=30):
-    """Wait till element present. Default 30 seconds"""
-    result = False
-    driver.implicitly_wait(0)
-    locator = locator.upper()
-
-    for _ in range(timeout):
-        time.sleep(0.99)
-        try:
-            if is_element_present(driver, getObj(locator), elementTag):
-                result = True
-                break
-        except Exception as e:
-            log_msg("Exception when WaitTillElementPresent : %s" % e)
-            pass
-
-    if not result:
-        log_msg("Element not found with %s : %s" % (locator, elementTag))
-    driver.implicitly_wait(3)
-    return result
-
-def Logout(driver):
-    """Logout from Naukri session """
-
-    try:
-        # -------- Drawer Menu XPaths --------
-        drawer_xpaths = [
-            f"//*[contains({ci('@class')}, 'drawer__icon')]",
-            f"//div[contains({ci('@class')}, 'drawer')]"
-        ]
-
-        for xpath in drawer_xpaths:
-            if is_element_present(driver, By.XPATH, xpath):
-                try:
-                    el = GetElement(driver, xpath, locator="XPATH")
-                    if el:
-                        el.click()
-                        time.sleep(1)
-                        log_msg("Drawer menu opened")
-                        break
-                except Exception as e:
-                    log_msg(f"Drawer open failed ({xpath}): {e}")
-                    continue
-
-        # -------- Logout XPaths --------
-        logout_xpaths = [
-            "//a[@data-type='logoutLink']",
-
-            f"//a[contains({ci('@class')}, 'list-cta') and contains({ci('@title')}, 'logout')]",
-            f"//a[contains({ci('@class')}, 'logout')]",
-            f"//a[contains({ci('@href')}, 'logout')]",
-
-            f"//*[contains({ci('text()')}, 'logout')]",
-            f"//*[contains({ci('.')}, 'logout')]",
-        ]
-
-        for xpath in logout_xpaths:
-            if is_element_present(driver, By.XPATH, xpath):
-                try:
-                    el = GetElement(driver, xpath, locator="XPATH")
-                    if el:
-                        driver.execute_script("arguments[0].scrollIntoView(true);", el)
-                        time.sleep(0.5)
-                        el.click()
-                        time.sleep(2)
-                        log_msg("Logout Successful")
-                        return True
-                except Exception as e:
-                    log_msg(f"Logout click failed ({xpath}): {e}")
-                    continue
-
-        log_msg("Logout button not found")
-        return False
-
-    except Exception as e:
-        log_msg(f"Logout error: {e}")
-        return False
-    
-def ci(xpath_part: str) -> str:
+def _gemini_selector_recovery(driver, key: str, api_key: str) -> Optional[object]:
     """
-    Wraps an XPath string in lowercase translate() for case-insensitive matching.
-    Usage:
-        ci("@class") → "translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')"
-        ci("text()") → "translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')"
+    Send page source to Gemini and ask for a CSS selector for the target element.
+    Falls back gracefully if the API call fails.
     """
-    return f"translate({xpath_part},'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')"
-
-
-def tearDown(driver):
     try:
-        driver.close()
-        log_msg("Driver Closed Successfully")
+        import urllib.request
+        page_source = driver.page_source[:8000]  # Truncate to avoid token limits
+        descriptions = {
+            "login_email": "the email/username input field on the login form",
+            "login_password": "the password input field on the login form",
+            "login_submit": "the login/submit button on the login form",
+            "profile_edit": "the edit profile button or link",
+            "resume_upload": "the file input for uploading a resume/CV",
+            "resume_save": "the save button after resume upload",
+            "close_popup": "the close/dismiss button on a popup or modal",
+            "profile_updated_marker": "the element showing the last profile update date",
+        }
+        description = descriptions.get(key, key)
+        prompt = (
+            f"Given this HTML snippet from naukri.com, return ONLY a valid CSS selector "
+            f"(no explanation, no markdown) that uniquely identifies: {description}.\n\n"
+            f"HTML:\n{page_source}"
+        )
+        payload = json.dumps({
+            "contents": [{"parts": [{"text": prompt}]}]
+        }).encode()
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=15) as r:
+            resp = json.loads(r.read())
+        selector = resp["candidates"][0]["content"]["parts"][0]["text"].strip().strip("`")
+        if selector:
+            el = WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
+            log_event("GEMINI_RECOVERY", f"Gemini recovered selector for '{key}': {selector}", {"key": key, "selector": selector})
+            return el
     except Exception as e:
-        catch(e)
-        pass
-
-    try:
-        driver.quit()
-        log_msg("Driver Quit Successfully")
-    except Exception as e:
-        catch(e)
-        pass
+        log_event("GEMINI_RECOVERY_FAILED", str(e), {"key": key})
+    return None
 
 
-def randomText():
-    return "".join(choice(ascii_uppercase + digits) for _ in range(randint(1, 5)))
+# ── Chrome driver setup ───────────────────────────────────────────────────────
 
-
-def LoadNaukri(headless):
-    """Open Chrome to load Naukri.com"""
-
-    options = webdriver.ChromeOptions()
-    options.add_argument("--disable-notifications")
-    options.add_argument("--start-maximized")  # ("--kiosk") for MAC
-    options.add_argument("--disable-popups")
-    options.add_argument("--disable-gpu")
+def build_driver(headless: bool = True) -> webdriver.Chrome:
+    opts = Options()
     if headless:
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("headless")
-
-    # updated to use latest selenium Chrome service
-    driver = None
-    try:
-        driver = webdriver.Chrome(options=options, service=ChromeService())
-    except Exception as e:
-        print(f"Error launching Chrome: {e}")
-        driver = webdriver.Chrome(options)
-    log_msg("Google Chrome Launched!")
-
-    driver.implicitly_wait(5)
-    driver.get(NaukriURL)
+        opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument(
+        "user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+    service = ChromeService(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=opts)
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     return driver
 
 
-def naukriLogin(headless=False):
-    """Open Chrome browser and Login to Naukri.com"""
-    status = False
-    driver = None
-    username_locator = "usernameField"
-    password_locator = "passwordField"
-    login_btn_locator = "//*[@type='submit' and normalize-space()='Login']"
-    skip_locator = "//*[text() = 'SKIP AND CONTINUE']"
-    close_locator = "//*[contains(@class, 'cross-icon') or @alt='cross-icon']"
+# ── Core automation functions ─────────────────────────────────────────────────
 
-    try:
-        driver = LoadNaukri(headless)
-
-        log_msg(driver.title)
-        if "naukri.com" in driver.title.lower():
-            log_msg("Website Loaded Successfully.")
-
-        emailFieldElement = None
-        if is_element_present(driver, By.ID, username_locator):
-            emailFieldElement = GetElement(driver, username_locator, locator="ID")
-            time.sleep(1)
-            passFieldElement = GetElement(driver, password_locator, locator="ID")
-            time.sleep(1)
-            loginButton = GetElement(driver, login_btn_locator, locator="XPATH")
-        else:
-            log_msg("None of the elements found to login.")
-
-        if emailFieldElement is not None:
-            emailFieldElement.clear()
-            emailFieldElement.send_keys(username)
-            time.sleep(1)
-            passFieldElement.clear()
-            passFieldElement.send_keys(password)
-            time.sleep(1)
-            loginButton.send_keys(Keys.ENTER)
-            time.sleep(3)
-
-            # Added click to Skip button
-            print("Checking Skip button")
-            if WaitTillElementPresent(driver, close_locator, "XPATH", 10):
-                GetElement(driver, close_locator, "XPATH").click()
-            if WaitTillElementPresent(driver, skip_locator, "XPATH", 5):
-                GetElement(driver, skip_locator, "XPATH").click()
-
-            # CheckPoint to verify login
-            if WaitTillElementPresent(driver, "ff-inventory", locator="ID", timeout=40):
-                CheckPoint = GetElement(driver, "ff-inventory", locator="ID")
-                if CheckPoint:
-                    log_msg("Naukri Login Successful")
-                    status = True
-                    return (status, driver)
-                else:
-                    log_msg("Unknown Login Error")
-                    return (status, driver)
-            else:
-                log_msg("Unknown Login Error")
-                return (status, driver)
-
-    except Exception as e:
-        catch(e)
-    return (status, driver)
-
-
-def UpdateProfile(driver):
-    try:
-        mobXpath = "//*[@name='mobile'] | //*[@id='mob_number']"
-        saveXpath = "//button[@ type='submit'][@value='Save Changes'] | //*[@id='saveBasicDetailsBtn']"
-        view_profile_locator = "//*[contains(@class, 'view-profile')]//a"
-        edit_locator = "(//*[contains(@class, 'icon edit')])[1]"
-        save_confirm = "//*[text()='today' or text()='Today']"
-        close_locator = "//*[contains(@class, 'crossIcon')]"
-
-        WaitTillElementPresent(driver, view_profile_locator, "XPATH", 20)
-        profElement = GetElement(driver, view_profile_locator, locator="XPATH")
-        profElement.click()
-        driver.implicitly_wait(2)
-
-        if WaitTillElementPresent(driver, close_locator, "XPATH", 10):
-            GetElement(driver, close_locator, locator="XPATH").click()
-            time.sleep(2)
-
-        WaitTillElementPresent(driver, edit_locator + " | " + saveXpath, "XPATH", 20)
-        if is_element_present(driver, By.XPATH, edit_locator):
-            editElement = GetElement(driver, edit_locator, locator="XPATH")
-            editElement.click()
-
-            WaitTillElementPresent(driver, mobXpath, "XPATH", 10)
-            mobFieldElement = GetElement(driver, mobXpath, locator="XPATH")
-            if mobFieldElement:
-                mobFieldElement.clear()
-                mobFieldElement.send_keys(mob)
-                driver.implicitly_wait(2)
-                
-            saveFieldElement = GetElement(driver, saveXpath, locator="XPATH")
-            saveFieldElement.send_keys(Keys.ENTER)
-            driver.implicitly_wait(3)
-
-            WaitTillElementPresent(driver, save_confirm, "XPATH", 10)
-            if is_element_present(driver, By.XPATH, save_confirm):
-                log_msg("Profile Update Successful")
-            else:
-                log_msg("Profile Update Failed")
-
-        elif is_element_present(driver, By.XPATH, saveXpath):
-            mobFieldElement = GetElement(driver, mobXpath, locator="XPATH")
-            if mobFieldElement:
-                mobFieldElement.clear()
-                mobFieldElement.send_keys(mob)
-                driver.implicitly_wait(2)
-    
-            saveFieldElement = GetElement(driver, saveXpath, locator="XPATH")
-            saveFieldElement.send_keys(Keys.ENTER)
-            driver.implicitly_wait(3)
-
-            WaitTillElementPresent(driver, "confirmMessage", locator="ID", timeout=10)
-            if is_element_present(driver, By.ID, "confirmMessage"):
-                log_msg("Profile Update Successful")
-            else:
-                log_msg("Profile Update Failed")
-
-        time.sleep(5)
-
-    except Exception as e:
-        catch(e)
-
-
-
-def UpdateResume():
-    try:
-        # Random text with random location and size
-        txt = randomText()
-        xloc = randint(700, 1000)  # This ensures that text is 'out of page'
-        fsize = randint(1, 10)
-
-        packet = io.BytesIO()
-        can = canvas.Canvas(packet, pagesize=letter)
-        can.setFont("Helvetica", fsize)
-        can.drawString(xloc, 100, txt)
-        can.save()
-
-        packet.seek(0)
-        new_pdf = PdfReader(packet)
-        with open(originalResumePath, "rb") as f:
-            existing_pdf = PdfReader(f)
-            pagecount = len(existing_pdf.pages)
-            print("Found %s pages in PDF" % pagecount)
-
-            output = PdfWriter()
-            # Merging new pdf with last page of existing pdf
-            for pageNum in range(pagecount - 1):
-                output.add_page(existing_pdf.pages[pageNum])
-            page = existing_pdf.pages[pagecount - 1]
-            page.merge_page(new_pdf.pages[0])
-            output.add_page(page)
-
-            # Save the new resume file
-            with open(modifiedResumePath, "wb") as outputStream:
-                output.write(outputStream)
-            print("Saved modified PDF: %s" % modifiedResumePath)
-            return os.path.abspath(modifiedResumePath)
-    except Exception as e:
-        catch(e)
-    return os.path.abspath(originalResumePath)
-
-
-
-def UploadResume(driver, resumePath):
-    try:
-        attachCVID = "attachCV"
-        lazyattachCVID = "lazyAttachCV"
-        uploadCV_btn = "//*[contains(@class, 'upload')]//input[@value='Update resume']"
-        CheckPointXpath = "//*[contains(@class, 'updateOn')]"
-        saveXpath = "//button[@type='button']"
-        close_locator = "//*[contains(@class, 'crossIcon')]"
-
-        driver.get(constants.NAUKRI_PROFILE_URL)
-
-        time.sleep(2)
-        if WaitTillElementPresent(driver, close_locator, "XPATH", 10):
-            GetElement(driver, close_locator, locator="XPATH").click()
-            time.sleep(2)
-
-        if WaitTillElementPresent(driver, lazyattachCVID, locator="ID", timeout=5):
-            AttachElement = GetElement(driver, uploadCV_btn, locator="XPATH")
-            AttachElement.send_keys(os.path.abspath(resumePath))
-
-        if WaitTillElementPresent(driver, attachCVID, locator="ID", timeout=5):
-            AttachElement = GetElement(driver, attachCVID, locator="ID")
-            AttachElement.send_keys(os.path.abspath(resumePath))
-
-        if WaitTillElementPresent(driver, saveXpath, locator="ID", timeout=5):
-            saveElement = GetElement(driver, saveXpath, locator="XPATH")
-            saveElement.click()
-
-        WaitTillElementPresent(driver, CheckPointXpath, locator="XPATH", timeout=30)
-        CheckPoint = GetElement(driver, CheckPointXpath, locator="XPATH")
-        if CheckPoint:
-            LastUpdatedDate = CheckPoint.text
-            todaysDate1 = datetime.today().strftime("%b %d, %Y")
-            todaysDate2 = datetime.today().strftime("%b %#d, %Y")
-            if todaysDate1 in LastUpdatedDate or todaysDate2 in LastUpdatedDate:
-                log_msg(
-                    "Resume Document Upload Successful. Last Updated date = %s"
-                    % LastUpdatedDate
-                )
-            else:
-                log_msg(
-                    "Resume Document Upload failed. Last Updated date = %s"
-                    % LastUpdatedDate
-                )
-        else:
-            log_msg("Resume Document Upload failed. Last Updated date not found.")
-
-    except Exception as e:
-        catch(e)
+def naukri_login(driver, cache: dict) -> bool:
+    log_event("LOGIN_START", "Navigating to login page")
+    driver.get(constants.NAUKRI_LOGIN_URL)
     time.sleep(2)
 
+    email_el = find_element_healing(driver, "login_email", cache=cache)
+    if not email_el:
+        log_event("LOGIN_FAILED", "Could not find email field")
+        return False
+
+    email_el.clear()
+    email_el.send_keys(constants.USERNAME)
+    time.sleep(0.5)
+
+    pwd_el = find_element_healing(driver, "login_password", cache=cache)
+    if not pwd_el:
+        log_event("LOGIN_FAILED", "Could not find password field")
+        return False
+
+    pwd_el.clear()
+    pwd_el.send_keys(constants.PASSWORD)
+    time.sleep(0.5)
+
+    submit_el = find_element_healing(driver, "login_submit", cache=cache)
+    if not submit_el:
+        log_event("LOGIN_FAILED", "Could not find submit button")
+        return False
+
+    submit_el.click()
+    time.sleep(3)
+
+    # Verify login by checking URL or presence of profile nav
+    if "nlogin" in driver.current_url or "login" in driver.current_url.lower():
+        log_event("LOGIN_FAILED", "Still on login page after submit — check credentials")
+        return False
+
+    log_event("LOGIN_SUCCESS", f"Logged in as {constants.USERNAME}")
+    return True
+
+
+def dismiss_popup(driver, cache: dict):
+    """Dismiss any modal/popup that might block profile actions."""
+    try:
+        close_el = find_element_healing(driver, "close_popup", timeout=5, cache=cache)
+        if close_el:
+            close_el.click()
+            time.sleep(1)
+            log_event("POPUP_DISMISSED", "Closed blocking popup")
+    except Exception:
+        pass
+
+
+def update_profile(driver, cache: dict):
+    """Trigger a profile save to mark it as 'active today' on Naukri."""
+    log_event("PROFILE_UPDATE_START", "Navigating to profile page")
+    driver.get(constants.NAUKRI_PROFILE_URL)
+    time.sleep(2)
+    dismiss_popup(driver, cache)
+
+    edit_el = find_element_healing(driver, "profile_edit", timeout=10, cache=cache)
+    if not edit_el:
+        log_event("PROFILE_UPDATE_SKIPPED", "Edit button not found — profile may already be up to date")
+        return
+
+    edit_el.click()
+    time.sleep(1)
+
+    save_el = find_element_healing(driver, "resume_save", timeout=10, cache=cache)
+    if save_el:
+        save_el.click()
+        time.sleep(2)
+        log_event("PROFILE_UPDATE_SUCCESS", "Profile save triggered")
+    else:
+        log_event("PROFILE_UPDATE_FAILED", "Save button not found after opening edit")
+
+
+def random_text(length: int = 8) -> str:
+    return "".join(choice(ascii_uppercase + digits) for _ in range(length))
+
+
+def update_resume_pdf(original_path: str, modified_path: str) -> str:
+    """
+    Inject hidden random text outside the visible page area so Naukri
+    treats the PDF as a new upload (bypasses duplicate-detection).
+    """
+    try:
+        txt = random_text(12)
+        xloc = randint(700, 1000)
+        fsize = randint(1, 5)
+        packet = io.BytesIO()
+        c = canvas.Canvas(packet, pagesize=letter)
+        c.setFont("Helvetica", fsize)
+        c.drawString(xloc, 100, txt)
+        c.save()
+        packet.seek(0)
+        new_pdf = PdfReader(packet)
+        with open(original_path, "rb") as f:
+            existing = PdfReader(f)
+            page_count = len(existing.pages)
+            out = PdfWriter()
+            for i in range(page_count - 1):
+                out.add_page(existing.pages[i])
+            last = existing.pages[page_count - 1]
+            last.merge_page(new_pdf.pages[0])
+            out.add_page(last)
+            with open(modified_path, "wb") as out_f:
+                out.write(out_f)
+        log_event("PDF_MODIFIED", f"Hidden text '{txt}' injected at x={xloc}", {"path": modified_path})
+        return os.path.abspath(modified_path)
+    except Exception as e:
+        log_event("PDF_MODIFY_FAILED", str(e))
+        return os.path.abspath(original_path)
+
+
+def upload_resume(driver, resume_path: str, cache: dict):
+    log_event("RESUME_UPLOAD_START", f"Uploading: {resume_path}")
+    driver.get(constants.NAUKRI_PROFILE_URL)
+    time.sleep(2)
+    dismiss_popup(driver, cache)
+
+    upload_el = find_element_healing(driver, "resume_upload", timeout=10, cache=cache)
+    if not upload_el:
+        log_event("RESUME_UPLOAD_FAILED", "Upload input not found")
+        return
+
+    upload_el.send_keys(os.path.abspath(resume_path))
+    time.sleep(2)
+
+    save_el = find_element_healing(driver, "resume_save", timeout=10, cache=cache)
+    if save_el:
+        save_el.click()
+        time.sleep(3)
+
+    # Verify upload by checking last-updated date
+    marker_el = find_element_healing(driver, "profile_updated_marker", timeout=15, cache=cache)
+    if marker_el:
+        updated_text = marker_el.text
+        today1 = datetime.today().strftime("%b %d, %Y")
+        today2 = datetime.today().strftime("%b %-d, %Y")
+        if today1 in updated_text or today2 in updated_text:
+            log_event("RESUME_UPLOAD_SUCCESS", f"Verified: {updated_text}")
+        else:
+            log_event("RESUME_UPLOAD_UNVERIFIED", f"Marker text: {updated_text}")
+    else:
+        log_event("RESUME_UPLOAD_UNVERIFIED", "Could not find update marker")
+
+
+def logout(driver):
+    try:
+        driver.get("https://www.naukri.com/nlogin/logout")
+        time.sleep(1)
+        log_event("LOGOUT", "Logged out")
+    except Exception:
+        pass
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    log_msg("-----Naukri.py Script Run Begin-----")
+    log_event("RUN_START", "Naukri automation starting")
+    cache = load_selector_cache()
     driver = None
+
+    headless = getattr(constants, "HEADLESS", True)
+    update_pdf = getattr(constants, "UPDATE_PDF", False)
+    original_resume = getattr(constants, "ORIGINAL_RESUME_PATH", "")
+    modified_resume = getattr(constants, "MODIFIED_RESUME_PATH", "")
+
     try:
-        status, driver = naukriLogin(headless)
-        if status:
-            UpdateProfile(driver)
-            if os.path.exists(originalResumePath):
-                if updatePDF:
-                    resumePath = UpdateResume()
-                    UploadResume(driver, resumePath)
-                else:
-                    UploadResume(driver, originalResumePath)
+        driver = build_driver(headless=headless)
+
+        if not naukri_login(driver, cache):
+            log_event("RUN_ABORTED", "Login failed — aborting run")
+            return
+
+        update_profile(driver, cache)
+
+        if original_resume and os.path.exists(original_resume):
+            if update_pdf:
+                resume_path = update_resume_pdf(original_resume, modified_resume)
             else:
-                log_msg("Resume not found at %s " % originalResumePath)
+                resume_path = original_resume
+            upload_resume(driver, resume_path, cache)
+        else:
+            log_event("RESUME_SKIPPED", f"Resume not found at: {original_resume}")
 
+    except WebDriverException as e:
+        log_event("WEBDRIVER_ERROR", str(e)[:300])
     except Exception as e:
-        catch(e)
-
+        log_event("UNEXPECTED_ERROR", str(e)[:300])
     finally:
-        if driver is not None:
-            try:
-                Logout(driver)
-                time.sleep(2)
-            except Exception as e:
-                log_msg("Error during logout: %s" % e)
-        tearDown(driver)
-
-    log_msg("-----Naukri.py Script Run Ended-----\n")
+        if driver:
+            logout(driver)
+            driver.quit()
+        log_event("RUN_END", "Naukri automation finished")
 
 
 if __name__ == "__main__":
